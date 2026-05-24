@@ -31,3 +31,8 @@ variable "ecr_image_uri" {
   # No default — must be provided when running terraform
   # Example: 741116633180.dkr.ecr.us-east-1.amazonaws.com/task-manager-api:latest
 }
+
+variable "alert_email" {
+  description = "Email address to receive alerts"
+  type        = string
+}
