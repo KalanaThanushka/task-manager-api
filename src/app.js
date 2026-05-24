@@ -14,7 +14,7 @@ let tasks = [];
 
 // Health Check — CI/CD pipelines use this to verify the app is alive
 app.get('/health', (req, res) => {
-  res.status(200).json({ status: 'OK', timestamp: new Date().toISOString() });
+  res.status(200).json({ status: 'OK', timestamp: new Date().toISOString(), version: '1.1.0' });
 });
 
 // GET all tasks

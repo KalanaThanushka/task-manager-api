@@ -1,55 +1,25 @@
-# Name of this pipeline — shows up on GitHub
-name: CI Pipeline
+ name: CI/CD Pipeline
 
-# TRIGGER: When should this pipeline run?
 on:
   push:
-    branches: [ main, develop ]   # runs when you push to main or develop
+    branches: [ main ]
   pull_request:
-    branches: [ main ]            # runs when someone opens a PR to main
+    branches: [ main ]
 
-# JOBS: What should it do?
+# Environment variables available to all jobs
+env:
+  AWS_REGION: us-east-1
+  ECR_REPOSITORY: task-manager-api
+  ECS_SERVICE: task-manager-api-service
+  ECS_CLUSTER: task-manager-api-cluster
+  CONTAINER_NAME: task-manager-api
+
 jobs:
 
-  # ── Job 1: Test & Lint ──────────────────────────────
+  # ── Job 1: Test ─────────────────────────────────────
   test:
     name: Test & Lint
-    runs-on: ubuntu-latest    # use a fresh Ubuntu Linux machine
-
-    steps:
-      # Step 1: Download your code onto the machine
-      - name: Checkout code
-        uses: actions/checkout@v4
-
-      # Step 2: Install Node.js on that machine
-      - name: Setup Node.js
-        uses: actions/setup-node@v4
-        with:
-          node-version: '18'
-          cache: 'npm'            # cache node_modules to speed up future runs
-
-      # Step 3: Install your dependencies (npm install)
-      - name: Install dependencies
-        run: npm ci               # 'npm ci' is like 'npm install' but faster & stricter for pipelines
-
-      # Step 4: Run your tests
-      - name: Run tests
-        run: npm test
-
-      # Step 5: Upload coverage report as an artifact
-      # This saves the coverage folder so you can download and view it
-      - name: Upload coverage report
-        uses: actions/upload-artifact@v4
-        with:
-          name: coverage-report
-          path: coverage/
-          retention-days: 7       # keep it for 7 days then auto delete
-
-  # ── Job 2: Security Scan ────────────────────────────
-  security:
-    name: Security Scan
     runs-on: ubuntu-latest
-    needs: test                   # only runs AFTER test job passes
 
     steps:
       - name: Checkout code
@@ -64,7 +34,134 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
-      # Checks your packages for known security vulnerabilities
+      - name: Run tests
+        run: npm test
+
+      - name: Upload coverage report
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-report
+          path: coverage/
+          retention-days: 7
+
+  # ── Job 2: Security Scan ────────────────────────────
+  security:
+    name: Security Scan
+    runs-on: ubuntu-latest
+    needs: test          # only runs after test passes
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '18'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
       - name: Run security audit
         run: npm audit --audit-level=high
-        continue-on-error: true   # don't fail the pipeline for warnings, just report
+        continue-on-error: true
+
+  # ── Job 3: Build & Push Docker Image ────────────────
+  build:
+    name: Build & Push to ECR
+    runs-on: ubuntu-latest
+    needs: security          # only runs after security scan passes
+    # Only build and deploy on push to main, not on pull requests
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+
+    # This job outputs the image tag so the deploy job can use it
+    outputs:
+      image: ${{ steps.build-image.outputs.image }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      # Configure AWS credentials from GitHub Secrets
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      # Login to ECR
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      # Build, tag, and push image to ECR
+      # Tag uses the git commit SHA for unique versioning
+      - name: Build, tag, and push image to ECR
+        id: build-image
+        env:
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+          # IMAGE_TAG = the git commit hash e.g. "a3f9c2d"
+          # This means every commit produces a unique image tag
+          # You can always roll back to any previous commit's image
+          IMAGE_TAG: ${{ github.sha }}
+        run: |
+          docker build -t $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG .
+          docker push $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
+          echo "image=$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG" >> $GITHUB_OUTPUT
+
+  # ── Job 4: Deploy to ECS ────────────────────────────
+  deploy:
+    name: Deploy to ECS
+    runs-on: ubuntu-latest
+    needs: build             # only runs after image is built and pushed
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      # Download the current task definition from ECS
+      # We update the image in it, then register the new version
+      - name: Download current task definition
+        run: |
+          aws ecs describe-task-definition \
+            --task-definition ${{ env.CONTAINER_NAME }} \
+            --query taskDefinition \
+            > task-definition.json
+
+      # Update the image URI in the task definition
+      - name: Update ECS task definition with new image
+        id: task-def
+        uses: aws-actions/amazon-ecs-render-task-definition@v1
+        with:
+          task-definition: task-definition.json
+          container-name: ${{ env.CONTAINER_NAME }}
+          image: ${{ needs.build.outputs.image }}
+
+      # Deploy the updated task definition to ECS
+      # ECS will gradually replace old containers with new ones
+      - name: Deploy to ECS service
+        uses: aws-actions/amazon-ecs-deploy-task-definition@v2
+        with:
+          task-definition: ${{ steps.task-def.outputs.task-definition }}
+          service: ${{ env.ECS_SERVICE }}
+          cluster: ${{ env.ECS_CLUSTER }}
+          # Wait until deployment is complete before marking pipeline as done
+          wait-for-service-stability: true
+
+      # Smoke test — verify the deployment actually works
+      - name: Smoke test deployment
+        run: |
+          ALB_URL="http://task-manager-api-alb-1499339907.us-east-1.elb.amazonaws.com"
+          echo "Testing $ALB_URL/health"
+          sleep 10
+          curl --fail $ALB_URL/health
+          echo "Deployment verified successfully!" 
